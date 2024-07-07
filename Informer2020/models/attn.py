@@ -46,26 +46,30 @@ class ProbAttention(nn.Module):
         self.dropout = nn.Dropout(attention_dropout)
 
     # 쿼리와 키의 샘플링된 부분을 이용해 어텐션 스코어를 계산
-    def _prob_QK(self, Q, K, sample_k, n_top): # n_top: c*ln(L_q)개의 query 만을 사용
+    # L_k : key 시퀀스의 길이
+    # sample_k : c*ln(L_k) or L_k
+    # n_top: c*ln(L_q)개의 query 만을 사용
+    def _prob_QK(self, Q, K, sample_k, n_top):
         # Q [B, H, L, D]
         B, H, L_K, E = K.shape
         _, _, L_Q, _ = Q.shape
 
         # calculate the sampled Q_K (query, key product)
         K_expand = K.unsqueeze(-3).expand(B, H, L_Q, L_K, E)
-        index_sample = torch.randint(L_K, (L_Q, sample_k)) # real U = U_part(factor*ln(L_k))*L_q
-        K_sample = K_expand[:, :, torch.arange(L_Q).unsqueeze(1), index_sample, :]
-        Q_K_sample = torch.matmul(Q.unsqueeze(-2), K_sample.transpose(-2, -1)).squeeze(-2)
+        index_sample = torch.randint(L_K, (L_Q, sample_k)) # real U = U_part(factor*ln(L_k))*L_q, [0, L_K) 범위에서 형상이 (L_Q, sample_k), 각 쿼리에 대해 키를 샘플링하는 데 사용되는 인덱스 
+        K_sample = K_expand[:, :, torch.arange(L_Q).unsqueeze(1), index_sample, :] # (B, H, L_Q, sample_k, E), U개의 키를 랜덤 샘플링 함
+        Q_K_sample = torch.matmul(Q.unsqueeze(-2), K_sample.transpose(-2, -1)).squeeze(-2) # (B, H, L_Q, sample_k)
 
         # find the Top_k query with sparisty measurement
-        M = Q_K_sample.max(-1)[0] - torch.div(Q_K_sample.sum(-1), L_K)
-        M_top = M.topk(n_top, sorted=False)[1]
+        # Q_K_sample.max(-1)[0] : 마지막 차원(sample_k)에서 최대값을 계산, 형상은 (B, H, L_Q)
+        M = Q_K_sample.max(-1)[0] - torch.div(Q_K_sample.sum(-1), L_K) # max - mean measurement
+        M_top = M.topk(n_top, sorted=False)[1] # M에서 상위 n_top 인덱스를 선택
 
         # use the reduced Q to calculate Q_K
         Q_reduce = Q[torch.arange(B)[:, None, None],
                      torch.arange(H)[None, :, None],
                      M_top, :] # factor*ln(L_q)
-        Q_K = torch.matmul(Q_reduce, K.transpose(-2, -1)) # factor*ln(L_q)*L_k
+        Q_K = torch.matmul(Q_reduce, K.transpose(-2, -1)) # factor*ln(L_q)*L_k, O(LlnL)
 
         return Q_K, M_top # score_top, index
 
@@ -91,7 +95,7 @@ class ProbAttention(nn.Module):
 
         context_in[torch.arange(B)[:, None, None],
                    torch.arange(H)[None, :, None],
-                   index, :] = torch.matmul(attn, V).type_as(context_in)
+                   index, :] = torch.matmul(attn, V).type_as(context_in)  # 어텐션 값 attn과 값 텐서 V를 곱하여 컨텍스트를 업데이트
         if self.output_attention:
             attns = (torch.ones([B, H, L_V, L_V])/L_V).type_as(attn).to(attn.device)
             attns[torch.arange(B)[:, None, None], torch.arange(H)[None, :, None], index, :] = attn
@@ -110,7 +114,7 @@ class ProbAttention(nn.Module):
         U_part = self.factor * np.ceil(np.log(L_K)).astype('int').item() # c*ln(L_k)
         u = self.factor * np.ceil(np.log(L_Q)).astype('int').item() # c*ln(L_q) 
 
-        U_part = U_part if U_part<L_K else L_K
+        U_part = U_part if U_part<L_K else L_K # c*ln(L_k) or L_K
         u = u if u<L_Q else L_Q
         
         scores_top, index = self._prob_QK(queries, keys, sample_k=U_part, n_top=u) 
